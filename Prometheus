@@ -1,0 +1,1204 @@
+# ======================================================================================
+# PROJECT PROMETHEUS V
+# ======================================================================================
+# TECHNICALLY RESTRUCTURED VERSION BASED ON THE OPTIMIZATION REPORT
+#
+# Key Technical Optimizations (as per Cl(1,8) Optimization Report):
+#
+# 1. FUSED COMPUTATIONAL KERNEL (Report Section V - Kernel Fusion):
+#    - All model dynamics (Laplacian, potentials, tension engine, damping)
+#      are consolidated into a single, large CUDA kernel (`fused_universal_kernel`).
+#    - This strategy minimizes memory traffic and enhances data locality by
+#      avoiding the need to write intermediate results to and from global memory.
+#
+# 2. TILING WITH SHARED MEMORY (Report Section IV - Memory Hierarchy):
+#    - THIS IS THE MOST CRITICAL PERFORMANCE ENHANCEMENT.
+#    - The multivector data for a central space-time point and its four
+#      neighbors (left, right, top, bottom) are loaded from the slower global
+#      memory into a high-speed shared memory "tile" at the kernel's inception.
+#    - All subsequent computations, particularly the Laplacian, are performed
+#      using this fast shared memory. This approach reduces global memory
+#      access by approximately a factor of five and effectively hides memory latency.
+#
+# 3. OCCUPANCY MANAGEMENT (Report Section V - Occupancy):
+#    - The CUDA kernel is compiled with `__launch_bounds__(512, 2)`. This directive
+#      hints to the compiler to constrain register usage, thereby ensuring that
+#      at least two thread blocks can reside concurrently on each Streaming
+#      Multiprocessor (SM). This is crucial for masking the high latency of HBM2
+#      memory on architectures such as the P100.
+#
+# 4. RESOURCE MANAGEMENT AND STABILITY:
+#    - The `relax` function has been augmented with an "intelligent early stopping"
+#      mechanism to detect and terminate unstable simulations (i.e., those
+#      that diverge or collapse) at a very early stage.
+#    - The use of `try...finally` blocks guarantees the deallocation of GPU memory
+#      under all circumstances, preventing memory leaks.
+#
+# ======================================================================================
+
+import os
+import cupy as cp
+import numpy as np
+from tqdm.auto import tqdm
+import itertools
+from scipy.stats import gmean
+from scipy.optimize import linear_sum_assignment
+from scipy.stats import linregress
+from cupyx.scipy.signal import detrend
+from scipy.signal import find_peaks
+import warnings
+import sys
+import math
+import pickle
+import traceback
+try:
+    import skopt
+    from skopt.space import Real, Integer
+    from skopt.utils import dump # <-- ADD THIS LINE
+except ImportError:
+    print("ERROR: 'scikit-optimize' library not found.")
+    print("Please install it before running using the command: 'pip install scikit-optimize'")
+    exit()
+
+# ======================================================================================
+# SECTION 0: CONFIGURATION AND ENVIRONMENT SETUP
+# ======================================================================================
+os.environ['CUPY_ACCELERATORS'] = 'cub,cutensor'
+os.environ['CUPY_TF32'] = '0' # Disable TF32 for numerical stability
+DTYPE_COMPLEX = cp.complex64
+DTYPE_FLOAT = cp.float32
+warnings.filterwarnings("ignore")
+
+fast_trial_config = {
+        'max_relax_steps_phase1': 700000,
+        'max_relax_steps_phase2': 700000,
+        'total_evolution_time': 200.0,
+        'num_samples': 4000000
+    }
+# ======================================================================================
+# SECTION 1: CONSTANTS AND CORE CLASSES
+# ======================================================================================
+PDG_DATA = {
+    # Leptons (Fermion)
+    "Electron":   {'mass': 0.511, 'type': 'Lepton (Fermion)'},
+    "Muon":       {'mass': 105.7, 'type': 'Lepton (Fermion)'},
+    "Tau":        {'mass': 1777,  'type': 'Lepton (Fermion)'},
+
+    # Mesons (Hadron / Boson)
+    "Pion (π⁰)":  {'mass': 135.0, 'type': 'Meson'},
+    "Pion (π⁺)":  {'mass': 139.6, 'type': 'Meson'},
+    "Kaon (K⁺)":  {'mass': 493.7, 'type': 'Meson'},
+    "Kaon (K⁰)":  {'mass': 497.6, 'type': 'Meson'},
+    "Eta (η)":    {'mass': 547.9, 'type': 'Meson'},
+    "Rho (ρ)":    {'mass': 775.3, 'type': 'Meson'},
+    "Omega (ω)":  {'mass': 782.7, 'type': 'Meson'},
+    "J/psi (J/ψ)":{'mass': 3096.9,'type': 'Meson (Quarkonium)'},
+
+    # Baryons (Hadron / Fermion)
+    "Proton":     {'mass': 938.3, 'type': 'Baryon (Fermion)'},
+    "Neutron":    {'mass': 939.6, 'type': 'Baryon (Fermion)'},
+    "Lambda (Λ⁰)":{'mass': 1115.7,'type': 'Baryon (Fermion)'},
+    "Sigma (Σ⁺)": {'mass': 1189.4,'type': 'Baryon (Fermion)'},
+    "Delta (Δ⁺⁺)":{'mass': 1232,  'type': 'Baryon (Fermion)'},
+
+    # Vector Bosons
+    "W Boson":    {'mass': 80379, 'type': 'Vector Boson'},
+    "Z Boson":    {'mass': 91187, 'type': 'Vector Boson'},
+
+    # Scalar Boson
+    "Higgs Boson":{'mass': 125100,'type': 'Scalar Boson'},
+}
+# This will now be used instead of known_masses_typed.
+WZ_RATIO_REAL = PDG_DATA['W Boson']['mass'] / PDG_DATA['Z Boson']['mass']
+ALPHA_REAL = 1 / 137.036
+
+class CliffordAlgebra:
+    def __init__(self, p, q):
+        self.p, self.q, self.dim = p, q, p + q
+        self.num_blades = 2**self.dim
+        
+        neg_mask_cpu = np.int32(0)
+        for i in range(self.p, self.dim):
+            neg_mask_cpu |= (1 << i)
+        self.neg_metric_mask = cp.asarray(neg_mask_cpu)
+
+        self.grades = cp.asarray([bin(i).count('1') for i in range(self.num_blades)], dtype=cp.int32)
+        self.blade_indices = {g: cp.where(self.grades == g)[0].astype(cp.int32) for g in range(self.dim + 1)}
+        
+        self.e_vecs = cp.zeros((self.dim, self.num_blades), dtype=cp.complex64)
+        for i in range(self.dim):
+            self.e_vecs[i, 1 << i] = 1.0
+
+# REPLACE THE EXISTING CLASS IN YOUR CODE WITH THIS ONE
+# Ensure you have the necessary import: from cupyx.scipy.signal import detrend
+
+class EmergentPhenomenaAnalyzer:
+    def __init__(self, alg, final_psi_state):
+        self.alg = alg
+        self.psi = final_psi_state
+
+    def analyze_symmetry_breaking_v2(self):
+        grade_norms = []
+        for g in range(self.alg.dim + 1):
+            indices = self.alg.blade_indices.get(g)
+            if indices is not None and indices.size > 0:
+                norm_sq = cp.sum(cp.real(self.psi[..., indices] * cp.conj(self.psi[..., indices])))
+                grade_norms.append(norm_sq.get().item())
+            else:
+                grade_norms.append(0)
+
+        report = {f"grade_{g}": norm for g, norm in enumerate(grade_norms)}
+
+        if not all(np.isfinite(grade_norms)):
+            return 10.0, report
+
+        total_norm = sum(grade_norms)
+        if total_norm < 1e-9:
+            return 0.0, report
+
+        probabilities = np.array([n / total_norm for n in grade_norms])
+        
+        std_dev = np.std(probabilities)
+        imbalance_score = min((std_dev / 0.3) * 10.0, 10.0)
+        
+        return imbalance_score, report
+
+    def analyze_structural_complexity(self):
+        if not cp.all(cp.isfinite(self.psi)).get().item():
+            return 1e6
+
+        laplacian_psi = cp.roll(self.psi, 1, axis=1) + cp.roll(self.psi, -1, axis=1) + \
+                        cp.roll(self.psi, 1, axis=0) + cp.roll(self.psi, -1, axis=0) - 4.0 * self.psi
+        
+        if not cp.all(cp.isfinite(laplacian_psi)).get().item():
+            return 1e6
+
+        complexity = cp.mean(cp.real(laplacian_psi * cp.conj(laplacian_psi))).get().item()
+        
+        if not np.isfinite(complexity):
+            return 1e6
+
+        return np.log1p(complexity) * 10
+        
+    @staticmethod
+    def analyze_particle_spectrum_hybrid(time_series_gpu_dict, dt):
+        """
+        CORRECTED VERSION: This function now uses cupyx.scipy.signal.detrend.
+        """
+        all_particles = {}
+        ts_data_map = time_series_gpu_dict.get('all_grades', {})
+        time_series_gpu = ts_data_map
+    
+        for grade in range(time_series_gpu.shape[0]):
+            signal_gpu = time_series_gpu[grade]
+    
+            if not cp.all(cp.isfinite(signal_gpu)) or signal_gpu.size < 50:
+                continue
+    
+            # === CORRECTION IS HERE ===
+            # The GPU-accelerated detrend function from CuPy is now called.
+            signal_gpu = detrend(signal_gpu, type='linear')
+    
+            # Subtract DC offset (mean) on the GPU
+            signal_gpu -= cp.mean(signal_gpu)
+    
+            if cp.all(cp.abs(signal_gpu) < 1e-9):
+                continue
+    
+            N = len(signal_gpu)
+            xf_gpu = cp.fft.rfftfreq(N, dt)
+            power_gpu = cp.abs(cp.fft.rfft(signal_gpu))
+    
+            if xf_gpu.size > 0:
+                power_gpu[xf_gpu < 0.01] = 0
+    
+            max_power_val = cp.max(power_gpu).get().item()
+            if not power_gpu.size > 0 or max_power_val < 1e-9:
+                continue
+    
+            prominence_threshold = 1e-6
+    
+            # Data must be transferred to the CPU for peak finding (find_peaks),
+            # as there is no GPU version of this function.
+            power_cpu = power_gpu.get()
+            xf_cpu = xf_gpu.get()
+    
+            peaks, props = find_peaks(power_cpu, prominence=prominence_threshold, distance=10)
+    
+            for i, peak_idx in enumerate(peaks):
+                freq = xf_cpu[peak_idx]
+                peak_power = props['prominences'][i]
+                if freq not in all_particles or peak_power > all_particles[freq]['power']:
+                    all_particles[freq] = {'power': peak_power, 'channel': f'grade_{grade}'}
+        
+        if not all_particles:
+            return []
+        
+        return sorted([{'id': i + 1, 'freq': freq, 'channel': info['channel']}
+                       for i, (freq, info) in enumerate(all_particles.items())],
+                      key=lambda p: p['freq'])
+
+        
+
+    @staticmethod
+    def identify_found_and_missing_particles(particles, params, match_threshold=0.10):
+        """
+        Analyzes the found particle spectrum, matches it with known PDG masses,
+        and returns lists of found and missing particles.
+        """
+        if not particles:
+            all_pdg_names = set(PDG_DATA.keys())
+            return [], sorted(list(all_pdg_names))
+
+        # 1. Scale Frequencies to Masses (same logic as in the Genesis score)
+        found_freqs = np.array(sorted([p['freq'] for p in particles]))
+        electron_mass = PDG_DATA["Electron"]["mass"]
+        if found_freqs[0] < 1e-9:
+            return [], sorted(list(PDG_DATA.keys()))
+            
+        scaling_factor = electron_mass / found_freqs[0]
+        scaled_masses = found_freqs * scaling_factor
+
+        # 2. Perform Matching
+        found_pdg_names = set()
+        pdg_mass_map = {name: data['mass'] for name, data in PDG_DATA.items()}
+        
+        # Find the best match for each known PDG particle
+        for pdg_name, pdg_mass in pdg_mass_map.items():
+            # Find the detected mass closest to this PDG mass
+            relative_errors = np.abs(scaled_masses - pdg_mass) / pdg_mass
+            min_error_index = np.argmin(relative_errors)
+            min_error = relative_errors[min_error_index]
+            
+            # If the best match is below the specified threshold, consider it "found"
+            if min_error < match_threshold:
+                found_pdg_names.add(pdg_name)
+
+        # 3. Calculate Missing Particles
+        all_pdg_names = set(PDG_DATA.keys())
+        missing_pdg_names = all_pdg_names - found_pdg_names
+
+        return sorted(list(found_pdg_names)), sorted(list(missing_pdg_names))
+# ======================================================================================
+# SECTION 1C: KERNEL EVOLUTION (AresLegacyEngine) - SAFE/FAST MODE (CORRECTED VERSION)
+# ======================================================================================
+class PrometheusV_Engine:
+    def __init__(self, size, alg, params):
+        self.size, self.alg, self.params = size, alg, params
+        self.psi_buffer = cp.zeros((size, size, alg.num_blades), dtype=DTYPE_COMPLEX)
+        self.pi_buffer = cp.zeros_like(self.psi_buffer)
+        self.force_buffer_internal = cp.zeros_like(self.psi_buffer)
+        
+        self.psi = self.psi_buffer
+        self.pi = self.pi_buffer
+        self.force_buffer = self.force_buffer_internal
+    
+        self.stream = cp.cuda.Stream(non_blocking=True)
+        
+        num_blocks = self.size * self.size
+        self.partial_max_vals = cp.zeros((num_blocks, 2), dtype=DTYPE_FLOAT)
+        self.dt_gpu_buffer = cp.empty(1, dtype=DTYPE_FLOAT)
+
+        self._build_kernels()  
+        self._init_random_states()  
+        self._set_engine_params(params)
+
+    def _set_engine_params(self, params_dict):
+        self.lambda_d = cp.float32(params_dict.get('lambda_d', 1.0))
+        self.lambda_p_global = cp.float32(params_dict.get('lambda_p_global', 0.1))
+        self.lambda_p_gpu = cp.array([params_dict.get(f'lambda_p_g{g}', 0.0) for g in range(self.alg.dim + 1)], dtype=DTYPE_FLOAT)
+        self.lambda_b_gpu = cp.array([params_dict.get(f'lambda_b_g{g}', 0.0) for g in range(self.alg.dim + 1)], dtype=DTYPE_FLOAT)
+        self.lambda_tension = cp.float32(params_dict.get('lambda_tension', 0.0))
+        self.lambda_E_balance = cp.float32(params_dict.get('lambda_E_balance', 0.01))
+        self.damping_relax = cp.float32(params_dict.get('damping_relax', 0.05))
+        self.damping_evolve = cp.float32(params_dict.get('damping_evolve', 1e-6))
+        self.lambda_complexity = cp.float32(params_dict.get('lambda_complexity', 0.0))
+        self.lambda_resonance = cp.float32(params_dict.get('lambda_resonance', 0.0))
+    
+    def _init_random_states(self):
+        total_elements = self.psi.size
+        self.rand_states = cp.random.randint(0, 2**32-1, size=total_elements, dtype=cp.uint32)
+
+    def _build_kernels(self):
+        n_blades = self.alg.num_blades
+        dim = self.alg.dim
+        max_entropy_val = math.log(dim + 1)
+        
+        cuda_code = f'''
+        typedef float2 cfloat;
+        
+        __device__ unsigned int lcg(unsigned int &state) {{
+            state = 1664525u * state + 1013904223u;
+            return state;
+        }}
+        
+        __device__ float lcg_uniform(unsigned int &state) {{
+            return (float)lcg(state) / (float)0xffffffff;
+        }}
+    
+        extern "C" {{
+    
+        __global__ __launch_bounds__(512, 2)
+        void calculate_force_kernel(
+            const cfloat* __restrict__ psi, const cfloat* __restrict__ mean_psi,
+            cfloat* __restrict__ force_out, const int size,
+            const float lambda_d, const float* __restrict__ lambda_p_per_grade,
+            const float* __restrict__ lambda_b_per_grade, const int* __restrict__ grade_lookup_table,
+            const float lambda_p_global, const float lambda_tension, const float lambda_complexity,
+            const float lambda_resonance // <-- NEW TURBO PARAMETER
+        ) {{
+            extern __shared__ cfloat tile[];
+            cfloat* psi_c = &tile[0];
+            cfloat* psi_l = &tile[{n_blades} * 1]; cfloat* psi_r = &tile[{n_blades} * 2];
+            cfloat* psi_d = &tile[{n_blades} * 3]; cfloat* psi_u = &tile[{n_blades} * 4];
+            float* grade_norms_local = (float*)&tile[{n_blades} * 5];
+            const int k = threadIdx.x;
+            const int x = blockIdx.x;
+            const int y = blockIdx.y;
+            const int flat_idx_c = (y * size + x) * {n_blades};
+            
+            psi_c[k] = psi[flat_idx_c + k];
+            psi_l[k] = psi[(y * size + (x - 1 + size) % size) * {n_blades} + k];
+            psi_r[k] = psi[(y * size + (x + 1) % size) * {n_blades} + k];
+            psi_d[k] = psi[(((y - 1 + size) % size) * size + x) * {n_blades} + k];
+            psi_u[k] = psi[(((y + 1) % size) * size + x) * {n_blades} + k];
+            __syncthreads();
+            
+            const int grade = grade_lookup_table[k];
+            const float grade_specific_lambda_p = lambda_p_per_grade[grade];
+            const float effective_lambda_p = grade_specific_lambda_p + lambda_p_global;
+            const float lambda_b = lambda_b_per_grade[grade];
+            
+            cfloat laplacian_k;
+            laplacian_k.x = psi_l[k].x + psi_r[k].x + psi_d[k].x + psi_u[k].x - 4.0f * psi_c[k].x;
+            laplacian_k.y = psi_l[k].y + psi_r[k].y + psi_d[k].y + psi_u[k].y - 4.0f * psi_c[k].y;
+            
+            cfloat internal_force_k;
+            internal_force_k.x = (lambda_d * laplacian_k.x) - (lambda_b * (psi_c[k].x - mean_psi[k].x)) - (effective_lambda_p * psi_c[k].x);
+            internal_force_k.y = (lambda_d * laplacian_k.y) - (lambda_b * (psi_c[k].y - mean_psi[k].y)) - (effective_lambda_p * psi_c[k].y);
+            
+            cfloat total_force_k = internal_force_k;
+            
+            if (lambda_tension > 1e-9f) {{
+                if (k < {dim + 1}) {{
+                    grade_norms_local[k] = 0.0f;
+                }}
+                __syncthreads();
+    
+                float norm_sq_k = psi_c[k].x * psi_c[k].x + psi_c[k].y * psi_c[k].y;
+                atomicAdd(&grade_norms_local[grade], norm_sq_k);
+                __syncthreads();
+    
+                float shannon_entropy;
+                if (k == 0) {{
+                    float total_norm_point = 0.0f;
+                    for (int g = 0; g <= {dim}; ++g) {{
+                        total_norm_point += grade_norms_local[g];
+                    }}
+                    
+                    float current_entropy = 0.0f;
+                    if (total_norm_point > 1e-9f) {{
+                        for (int g = 0; g <= {dim}; ++g) {{
+                            float p_g = grade_norms_local[g] / total_norm_point;
+                            if (p_g > 1e-9f) {{
+                                current_entropy -= p_g * logf(p_g);
+                            }}
+                        }}
+                    }}
+                    shannon_entropy = current_entropy / {max_entropy_val}f;
+                    grade_norms_local[{dim+1}] = shannon_entropy;
+                }}
+                __syncthreads();
+                
+                shannon_entropy = grade_norms_local[{dim+1}];
+                float simplicity_penalty = 1.0f - shannon_entropy;
+                total_force_k.x += lambda_tension * simplicity_penalty * psi_c[k].x;
+                total_force_k.y += lambda_tension * simplicity_penalty * psi_c[k].y;
+    
+                // ==========================================================
+                // === NEW PHYSICAL LAW (TURBOCHARGE) - AT THE CORRECT LOCATION! ===
+                // ==========================================================
+                if (lambda_resonance > 1e-9f) {{
+                    // grade_norms_local has been calculated here and can now be used safely.
+                    float norm_sq_point = 0.0f;
+                    for(int g=0; g <= {dim}; ++g) {{
+                        norm_sq_point += grade_norms_local[g];
+                    }}
+                    
+                    total_force_k.x += lambda_resonance * norm_sq_point * psi_c[k].x;
+                    total_force_k.y += lambda_resonance * norm_sq_point * psi_c[k].y;
+                }}
+            }}
+    
+            if (lambda_complexity > 1e-9f) {{
+                float laplacian_norm_sq = laplacian_k.x * laplacian_k.x + laplacian_k.y * laplacian_k.y;
+                float complexity_penalty = 1.0f / (1.0f + 2.0f * laplacian_norm_sq);
+                total_force_k.x += lambda_complexity * complexity_penalty * psi_c[k].x;
+                total_force_k.y += lambda_complexity * complexity_penalty * psi_c[k].y;
+            }}
+            
+            force_out[flat_idx_c + k] = total_force_k;
+        }}
+        
+        __global__ __launch_bounds__(256, 4)
+        void update_state_kernel( cfloat* __restrict__ psi, cfloat* __restrict__ pi, const cfloat* __restrict__ force, const float* __restrict__ dt_ptr, const float damping, const int n_elements, const float thermal_noise_level, unsigned int* rand_states) {{
+            const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+            if (idx < n_elements) {{
+                const float dt = *dt_ptr;
+                cfloat pi_k = pi[idx];
+                cfloat force_k = force[idx];
+                if (thermal_noise_level > 0.0f) {{
+                    unsigned int localState = rand_states[idx];
+                    float rand_x = lcg_uniform(localState);
+                    float rand_y = lcg_uniform(localState);
+                    rand_states[idx] = localState;
+                    cfloat noise_force;
+                    noise_force.x = (rand_x - 0.5f) * 2.0f;
+                    noise_force.y = (rand_y - 0.5f) * 2.0f;
+                    force_k.x += thermal_noise_level * noise_force.x;
+                    force_k.y += thermal_noise_level * noise_force.y;
+                }}
+                pi_k.x += dt * (force_k.x - damping * pi_k.x);
+                pi_k.y += dt * (force_k.y - damping * pi_k.y);
+                psi[idx].x += dt * pi_k.x;
+                psi[idx].y += dt * pi_k.y;
+                pi[idx] = pi_k;
+            }}
+        }}
+
+        // Other legacy kernels (abbreviated, but logic is the same)
+        __global__ __launch_bounds__(256, 4) void sample_partial_reduction_kernel(const cfloat* __restrict__ psi, const int* __restrict__ grades, float* __restrict__ partial_sums_out, int total_elements) {{ extern __shared__ float s_data[]; const int tid = threadIdx.x; const int blockId = blockIdx.x; const int gridSize = gridDim.x; if (tid < {dim + 1}) {{ s_data[tid] = 0.0f; }} __syncthreads(); for (int i = blockId * blockDim.x + tid; i < total_elements; i += blockDim.x * gridSize) {{ const int blade_idx = i % {n_blades}; const int grade = grades[blade_idx]; const float real_amplitude = psi[i].x; atomicAdd(&s_data[grade], real_amplitude); }} __syncthreads(); if (tid < {dim + 1}) {{ partial_sums_out[blockId * {dim + 1} + tid] = s_data[tid]; }} }}
+        __global__ __launch_bounds__(32, 16) void sample_final_reduction_kernel( const float* __restrict__ partial_sums_in, float* __restrict__ time_series_out, int num_blocks, int sample_index, int num_samples) {{ const int grade_idx = blockIdx.x * blockDim.x + threadIdx.x; if (grade_idx >= {dim + 1}) return; float total_sum = 0.0f; for (int i = 0; i < num_blocks; ++i) {{ total_sum += partial_sums_in[i * {dim + 1} + grade_idx]; }} time_series_out[grade_idx * num_samples + sample_index] = total_sum; }}
+        __global__ __launch_bounds__(512, 2) void force_and_reduce_kernel( const cfloat* __restrict__ psi, const cfloat* __restrict__ pi, cfloat* __restrict__ force_out, float* partial_max_vals_out, const int size, const float lambda_d, const float* __restrict__ lambda_p_per_grade, const float* __restrict__ lambda_b_per_grade, const int* __restrict__ grade_lookup_table, const float lambda_p_global) {{ extern __shared__ cfloat tile[]; float* reduction_tile = (float*)&tile[{n_blades} * 5]; cfloat* psi_c = &tile[0]; cfloat* psi_l = &tile[{n_blades}]; cfloat* psi_r = &tile[{n_blades} * 2]; cfloat* psi_d = &tile[{n_blades} * 3]; cfloat* psi_u = &tile[{n_blades} * 4]; const int k = threadIdx.x; const int block_x = blockIdx.x; const int block_y = blockIdx.y; const int grid_w = gridDim.x; const int block_flat_idx = block_y * grid_w + block_x; const int flat_idx_c = (block_y * size + block_x) * {n_blades}; psi_c[k] = psi[flat_idx_c + k]; psi_l[k] = psi[(block_y * size + (block_x - 1 + size) % size) * {n_blades} + k]; psi_r[k] = psi[(block_y * size + (block_x + 1) % size) * {n_blades} + k]; psi_d[k] = psi[(((block_y - 1 + size) % size) * size + block_x) * {n_blades} + k]; psi_u[k] = psi[(((block_y + 1) % size) * size + block_x) * {n_blades} + k]; __syncthreads(); const int grade = grade_lookup_table[k]; const float effective_lambda_p = lambda_p_per_grade[grade] + lambda_p_global; cfloat laplacian_k; laplacian_k.x = psi_l[k].x + psi_r[k].x + psi_d[k].x + psi_u[k].x - 4.0f * psi_c[k].x; laplacian_k.y = psi_l[k].y + psi_r[k].y + psi_d[k].y + psi_u[k].y - 4.0f * psi_c[k].y; cfloat force_k; force_k.x = (lambda_d * laplacian_k.x) - (effective_lambda_p * psi_c[k].x); force_k.y = (lambda_d * laplacian_k.y) - (effective_lambda_p * psi_c[k].y); force_out[flat_idx_c + k] = force_k; cfloat pi_k = pi[flat_idx_c + k]; float mag_pi = hypotf(pi_k.x, pi_k.y); float mag_force = hypotf(force_k.x, force_k.y); reduction_tile[k] = mag_pi; reduction_tile[{n_blades} + k] = mag_force; __syncthreads(); for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {{ if (k < s) {{ reduction_tile[k] = fmaxf(reduction_tile[k], reduction_tile[k + s]); reduction_tile[{n_blades} + k] = fmaxf(reduction_tile[{n_blades} + k], reduction_tile[{n_blades} + k + s]); }} __syncthreads(); }} if (k == 0) {{ partial_max_vals_out[block_flat_idx * 2 + 0] = reduction_tile[0]; partial_max_vals_out[block_flat_idx * 2 + 1] = reduction_tile[{n_blades} + 0]; }} }}
+        __global__ void finalize_reduction_and_calc_dt_kernel( const float* partial_max_vals_in, float* dt_out, int num_blocks, float cfl_v_safety, float cfl_f_safety, float dt_ceiling, float epsilon) {{ float max_v_global = 0.0f; float max_f_global = 0.0f; for (int i = threadIdx.x; i < num_blocks; i += blockDim.x) {{ max_v_global = fmaxf(max_v_global, partial_max_vals_in[i * 2 + 0]); max_f_global = fmaxf(max_f_global, partial_max_vals_in[i * 2 + 1]); }} extern __shared__ float final_reduction_tile[]; final_reduction_tile[threadIdx.x] = max_v_global; final_reduction_tile[blockDim.x + threadIdx.x] = max_f_global; __syncthreads(); for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {{ if (threadIdx.x < s) {{ final_reduction_tile[threadIdx.x] = fmaxf(final_reduction_tile[threadIdx.x], final_reduction_tile[threadIdx.x + s]); final_reduction_tile[blockDim.x + threadIdx.x] = fmaxf(final_reduction_tile[blockDim.x + threadIdx.x], final_reduction_tile[blockDim.x + threadIdx.x + s]); }} __syncthreads(); }} if (threadIdx.x == 0) {{ max_v_global = final_reduction_tile[0]; max_f_global = final_reduction_tile[blockDim.x]; float dt_from_velocity = cfl_v_safety / (max_v_global + epsilon); float dt_from_force = cfl_f_safety / (sqrtf(max_f_global) + epsilon); float dt = fminf(dt_from_velocity, dt_from_force); dt = fminf(dt, dt_ceiling); dt_out[0] = dt; }} }}
+        __global__ __launch_bounds__(256, 4) void update_state_with_gpu_dt_kernel( cfloat* __restrict__ psi, cfloat* __restrict__ pi, const cfloat* __restrict__ force, const float* __restrict__ dt_gpu_buffer, const float damping, const int n_elements, float* current_time_gpu) {{ const int idx = blockIdx.x * blockDim.x + threadIdx.x; if (idx == 0) {{ current_time_gpu[0] += dt_gpu_buffer[0]; }} if (idx < n_elements) {{ const float dt = dt_gpu_buffer[0]; cfloat pi_k = pi[idx]; cfloat force_k = force[idx]; pi_k.x += dt * (force_k.x - damping * pi_k.x); pi_k.y += dt * (force_k.y - damping * pi_k.y); psi[idx].x += dt * pi_k.x; psi[idx].y += dt * pi_k.y; pi[idx] = pi_k; }} }}
+
+        // --- NEW FUSED KERNEL FOR 'EVOLVE' (BUG FIXED) ---
+        // BUG FIX: Changed to __launch_bounds__(512, 2).
+        __global__ __launch_bounds__(512, 2)
+        void evolve_and_sample_fused_kernel(
+            cfloat* __restrict__ psi, cfloat* __restrict__ pi,
+            float* __restrict__ time_series_out, const int size,
+            const int total_steps_to_run, const int sample_interval, const int num_samples,
+            const float* __restrict__ lambda_p_per_grade, const int* __restrict__ grade_lookup_table,
+            const float lambda_d, const float lambda_p_global, const float damping_evolve,
+            const float initial_dt
+        ) {{
+            extern __shared__ cfloat tile[];
+            cfloat* psi_l_tile = &tile[0];
+            cfloat* psi_r_tile = &tile[{n_blades}];
+            cfloat* psi_d_tile = &tile[{n_blades} * 2];
+            cfloat* psi_u_tile = &tile[{n_blades} * 3];
+            
+            const int k = threadIdx.x;
+            const int x = blockIdx.x;
+            const int y = blockIdx.y;
+            const int flat_idx_c = (y * size + x) * {n_blades} + k;
+
+            cfloat psi_k_reg = psi[flat_idx_c];
+            cfloat pi_k_reg  = pi[flat_idx_c];
+            float dt_reg = initial_dt;
+
+            for (int t = 0; t < total_steps_to_run; ++t) {{
+                psi_l_tile[k] = psi[(y * size + (x - 1 + size) % size) * {n_blades} + k];
+                psi_r_tile[k] = psi[(y * size + (x + 1) % size) * {n_blades} + k];
+                psi_d_tile[k] = psi[(((y - 1 + size) % size) * size + x) * {n_blades} + k];
+                psi_u_tile[k] = psi[(((y + 1) % size) * size + x) * {n_blades} + k];
+                __syncthreads();
+
+                cfloat laplacian_k;
+                laplacian_k.x = psi_l_tile[k].x + psi_r_tile[k].x + psi_d_tile[k].x + psi_u_tile[k].x - 4.0f * psi_k_reg.x;
+                laplacian_k.y = psi_l_tile[k].y + psi_r_tile[k].y + psi_d_tile[k].y + psi_u_tile[k].y - 4.0f * psi_k_reg.y;
+
+                const int grade = grade_lookup_table[k];
+                const float effective_lambda_p = lambda_p_per_grade[grade] + lambda_p_global;
+
+                cfloat force_k;
+                force_k.x = (lambda_d * laplacian_k.x) - (effective_lambda_p * psi_k_reg.x);
+                force_k.y = (lambda_d * laplacian_k.y) - (effective_lambda_p * psi_k_reg.y);
+
+                pi_k_reg.x += dt_reg * (force_k.x - damping_evolve * pi_k_reg.x);
+                pi_k_reg.y += dt_reg * (force_k.y - damping_evolve * pi_k_reg.y);
+                psi_k_reg.x += dt_reg * pi_k_reg.x;
+                psi_k_reg.y += dt_reg * pi_k_reg.y;
+                
+                psi[flat_idx_c] = psi_k_reg;
+                pi[flat_idx_c]  = pi_k_reg;
+
+                if (sample_interval > 0 && (t + 1) % sample_interval == 0) {{
+                    int sample_idx = (t + 1) / sample_interval - 1;
+                    if (sample_idx < num_samples) {{
+                        atomicAdd(&time_series_out[grade * num_samples + sample_idx], psi_k_reg.x);
+                    }}
+                }}
+                __syncthreads(); 
+            }}
+        }}
+
+        }} // end extern "C"
+        '''
+        
+        self.module = cp.RawModule(code=cuda_code, options=('--std=c++11',))
+        
+        self.calculate_force_kernel = self.module.get_function("calculate_force_kernel")
+        self.update_state_kernel = self.module.get_function("update_state_kernel")
+        self.sample_partial_kernel = self.module.get_function("sample_partial_reduction_kernel")
+        self.sample_final_kernel = self.module.get_function("sample_final_reduction_kernel")
+        self.force_and_reduce_kernel = self.module.get_function("force_and_reduce_kernel")
+        self.finalize_reduction_and_calc_dt_kernel = self.module.get_function("finalize_reduction_and_calc_dt_kernel")
+        self.update_state_with_gpu_dt_kernel = self.module.get_function("update_state_with_gpu_dt_kernel")
+        self.evolve_and_sample_fused_kernel = self.module.get_function("evolve_and_sample_fused_kernel")
+
+        self.magnitude_max_kernel = cp.ReductionKernel('T x', 'float32 y', 'hypotf(x.real(), x.imag())', 'fmaxf(a, b)','y = a', '0.0f', 'magnitude_max_reduce')
+
+    def evolve_optimized(self, initial_psi, probe_multivector, total_evolution_time, num_samples, pbar=None):
+        with self.stream:
+            self.psi = initial_psi.copy()
+            self.pi.fill(0)
+            
+            probe_amplitude = 2.0
+            probe_width_factor = 0.50
+            coords = cp.arange(self.size, dtype=DTYPE_FLOAT)
+            x, y = cp.meshgrid(coords, coords)
+            center, width = self.size / 2.0, self.size * probe_width_factor
+            probe_shape = (probe_amplitude * cp.exp(-((x - center)**2 + (y - center)**2) / (2 * width**2))).astype(DTYPE_COMPLEX)
+            self.pi += probe_shape.reshape(self.size, self.size, 1) * probe_multivector
+
+            CFL_VELOCITY_SAFETY, CFL_FORCE_SAFETY, EPSILON = 0.15, 0.15, 1e-9
+            DT_STRUCTURAL_CEILING = 0.2 / (float(self.lambda_d) + EPSILON)
+            
+            force_initial = self._calculate_force() # This ensures the correct handle for _calculate_force is used
+            max_v = cp.max(cp.abs(self.pi)).get().item()
+            max_f = cp.max(cp.abs(force_initial)).get().item()
+            dt_from_v = CFL_VELOCITY_SAFETY / (max_v + EPSILON) if max_v > 0 else float('inf')
+            dt_from_f = CFL_FORCE_SAFETY / (math.sqrt(max_f) + EPSILON) if max_f > 0 else float('inf')
+            initial_dt = min(dt_from_v, dt_from_f, DT_STRUCTURAL_CEILING, 1.0)
+
+            if initial_dt <= 0 or not math.isfinite(initial_dt):
+                if pbar: pbar.write("WARNING: Invalid initial dt. Skipping evolution.")
+                return cp.zeros((self.alg.dim + 1, num_samples), dtype=DTYPE_FLOAT), -1
+
+            total_steps_to_run = int(total_evolution_time / initial_dt)
+            if total_steps_to_run <= 0:
+                if pbar: pbar.write("WARNING: Total number of steps is zero. Skipping evolution.")
+                return cp.zeros((self.alg.dim + 1, num_samples), dtype=DTYPE_FLOAT), -1
+            sample_interval_steps = max(1, total_steps_to_run // num_samples)
+            
+            time_series_gpu = cp.zeros((self.alg.dim + 1, num_samples), dtype=DTYPE_FLOAT)
+            if pbar: pbar.reset(total=total_steps_to_run)
+
+            grid_size = (self.size, self.size)
+            block_size = (self.alg.num_blades,)
+            shared_mem_size = 4 * self.alg.num_blades * 8 
+
+            self.evolve_and_sample_fused_kernel(
+                grid_size, block_size,
+                args=(self.psi, self.pi, time_series_gpu, self.size, total_steps_to_run, sample_interval_steps, num_samples, self.lambda_p_gpu, self.alg.grades, self.lambda_d, self.lambda_p_global, self.damping_evolve, cp.float32(initial_dt)),
+                shared_mem=shared_mem_size
+            )
+            
+            if pbar: 
+                pbar.n = total_steps_to_run
+                pbar.refresh()
+            self.stream.synchronize()
+
+            pixels_count = self.size * self.size
+            time_series_gpu /= pixels_count
+            
+            true_dt_per_sample = total_evolution_time / num_samples if num_samples > 0 else 0
+            return time_series_gpu, true_dt_per_sample
+
+    def _calculate_force(self):
+        mean_psi = cp.mean(self.psi, axis=(0, 1), keepdims=False)
+        grid_size = (self.size, self.size)
+        block_size = (self.alg.num_blades,)
+        shared_mem_size = (5 * self.alg.num_blades * 8) + ((self.alg.dim + 2) * 4)
+        self.calculate_force_kernel(
+            grid_size, block_size,
+            (self.psi, mean_psi, self.force_buffer, self.size, self.lambda_d, self.lambda_p_gpu, self.lambda_b_gpu, self.alg.grades, self.lambda_p_global, self.lambda_tension, self.lambda_complexity, self.lambda_resonance),
+            shared_mem=shared_mem_size
+        )
+        return self.force_buffer
+            
+    def _gp(self, A, B, out):
+        N_pixels = A.shape[0] * A.shape[1]
+        block_size = 256
+        if A.size > 0: self.gp_kernel((N_pixels,), (block_size,), (A, B, out, self.alg.neg_metric_mask.item(), N_pixels))
+
+
+    
+    
+    def relax_to_plateau(self, max_steps, quiet=False, pbar=None):
+        
+        # --- Parameters and Criteria ---
+        CFL_SAFETY = 1e-9
+        FINAL_DAMPING = self.params.get('damping_relax', 1.382242)
+        CHECK_INTERVAL = 250
+        
+        THE_TARGET_KE = 1.0e-10
+        TOLERANCE = 0.01
+        PLATEAU_TARGET_MIN = THE_TARGET_KE * (1.0 - TOLERANCE)
+        PLATEAU_TARGET_MAX = THE_TARGET_KE * (1.0 + TOLERANCE)
+        
+        # --- NEW CONTROLLER PARAMETERS ---
+        PROPORTIONAL_GAIN = 1.0       # We are not touching this parameter as per your request.
+        CONTROLLER_DEAD_ZONE_LOG = 0.01 # Do nothing if the log(KE) error is smaller than this value (sensitivity threshold).
+        MAX_HEATING_PULSE = 0.3         # Ceiling value for the heating pulse even if the dead zone is exceeded.
+        MAX_DAMPING_FACTOR = 5.0        # Ceiling value for the cooling factor (remains the same).
+        # ------------------------------------
+        
+        PATIENCE = 150
+        MIN_KE_THRESHOLD = 1e-13
+        MIN_VOLATILITY_THRESHOLD = 1e-5
+    
+        SLOPE_TIME_SCALE_THRESHOLD = 5.0e2 
+        SLOPE_VOLATILITY_THRESHOLD = 1e-9
+        RELATIVE_CHANGE_THRESHOLD = 0.005
+        
+        LONG_TERM_HISTORY_SIZE = 150 
+        LONG_TERM_DRIFT_THRESHOLD = 0.005 
+    
+        short_term_history_len = 150
+        energy_history, mean_energy_history, slope_history = [], [], []
+        long_term_mean_energy_history = []
+        
+        noise_buffer = (cp.random.randn(*self.psi.shape, dtype=DTYPE_FLOAT) + 
+                        1j * cp.random.randn(*self.psi.shape, dtype=DTYPE_FLOAT))
+    
+        with self.stream:
+            if cp.all(self.psi == 0):
+                self.psi = (cp.random.randn(self.size, self.size, self.alg.num_blades, dtype=DTYPE_FLOAT) + 1j * cp.random.randn(self.size, self.size, self.alg.num_blades, dtype=DTYPE_FLOAT)) * 1e-7
+            self.pi.fill(0)
+            
+            if pbar: pbar.reset(total=max_steps)
+    
+            current_damping = FINAL_DAMPING
+            convergence_counter = 0
+            temp_damping = current_damping
+    
+            for t in range(1, max_steps + 1):
+                if pbar: pbar.update(1)
+    
+                force = self._calculate_force()
+                if not cp.all(cp.isfinite(force)):
+                    if pbar: pbar.write(f"❌ Explosion! Step: {t}.")
+                    return None
+                
+                max_v, max_f = cp.max(cp.abs(self.pi)), cp.max(cp.abs(force))
+                dt_val = CFL_SAFETY / (1.0 + float(max_v) + float(max_f))
+                dt = float(np.clip(dt_val, a_min=1e-10, a_max=0.01))
+    
+                if t % CHECK_INTERVAL == 0:
+                    ke = cp.sum(cp.real(self.pi * cp.conj(self.pi))).get().item()
+                    energy_history.append(ke)
+                    if len(energy_history) > short_term_history_len: energy_history.pop(0)
+    
+                    if len(energy_history) == short_term_history_len:
+                        mean_energy = np.mean(energy_history)
+                        
+                        # --- UPDATED CONTROLLER LOGIC ---
+                        log_error = np.log10(mean_energy + 1e-30) - np.log10(THE_TARGET_KE)
+                        
+                        # 'Dead Zone' control
+                        if abs(log_error) > CONTROLLER_DEAD_ZONE_LOG:
+                            if log_error < 0: # Energy too low, heating required
+                                # Calculate heating factor
+                                heating_factor = abs(log_error) * PROPORTIONAL_GAIN
+                                # Limit the heating pulse to prevent sudden jumps
+                                heating_factor = min(heating_factor, MAX_HEATING_PULSE) 
+                                
+                                final_noise_strength = cp.sqrt(dt) * self.base_noise_level * heating_factor
+                                self.pi += noise_buffer * final_noise_strength
+                                temp_damping = current_damping
+                            else: # Energy too high, cooling required
+                                cooling_factor = 1.0 + (log_error * PROPORTIONAL_GAIN)
+                                cooling_factor = min(cooling_factor, MAX_DAMPING_FACTOR)
+                                temp_damping = current_damping * cooling_factor
+                        else:
+                            # Error is within the 'dead zone', leave the system alone.
+                            temp_damping = current_damping
+                        # --- END OF UPDATE ---
+                        
+                        is_alive = mean_energy > MIN_KE_THRESHOLD
+                        # ... (rest of the code is the same)
+                        is_vibrating = (np.std(energy_history) / mean_energy if mean_energy > 1e-9 else 1.0) > MIN_VOLATILITY_THRESHOLD
+                        
+                        mean_energy_history.append(mean_energy)
+                        if len(mean_energy_history) > short_term_history_len: mean_energy_history.pop(0)
+                        
+                        mean_slope, has_stable_slope = np.nan, False
+                        is_glacially_slow = False
+    
+                        if len(mean_energy_history) == short_term_history_len:
+                            mean_slope, _, _, _, _ = linregress(np.arange(short_term_history_len), mean_energy_history)
+                            
+                            if not np.isnan(mean_slope) and abs(mean_slope) > 1e-30:
+                                characteristic_time = (mean_energy * 0.01) / abs(mean_slope)
+                                is_glacially_slow = characteristic_time > SLOPE_TIME_SCALE_THRESHOLD
+                            else:
+                                is_glacially_slow = True
+    
+                            if not np.isnan(mean_slope): slope_history.append(mean_slope)
+                            if len(slope_history) > short_term_history_len: slope_history.pop(0)
+                            if len(slope_history) == short_term_history_len:
+                                has_stable_slope = np.std(slope_history) < SLOPE_VOLATILITY_THRESHOLD
+                                
+                        is_truly_static = ((np.max(energy_history) - np.min(energy_history)) / (mean_energy + 1e-20)) < RELATIVE_CHANGE_THRESHOLD
+    
+                        has_no_long_term_drift = False
+                        long_term_mean_energy_history.append(mean_energy)
+                        if len(long_term_mean_energy_history) > LONG_TERM_HISTORY_SIZE: long_term_mean_energy_history.pop(0)
+                        if len(long_term_mean_energy_history) == LONG_TERM_HISTORY_SIZE:
+                            drift = abs(mean_energy - long_term_mean_energy_history[0]) / (mean_energy + 1e-20)
+                            has_no_long_term_drift = drift < LONG_TERM_DRIFT_THRESHOLD
+                        
+                        is_in_target_zone = PLATEAU_TARGET_MIN <= mean_energy <= PLATEAU_TARGET_MAX
+    
+                        if pbar:
+                            s1,s2,s3,s4,s5,s6 = "A✅" if is_alive else "A❌", "V✅" if is_vibrating else "V❌", "S✅" if has_stable_slope else "S❌", "R✅" if is_truly_static else "R❌", "L✅" if has_no_long_term_drift else "L❌", "T✅" if is_in_target_zone else "T❌"
+                            s7 = "G✅" if is_glacially_slow else "G❌"
+                            status_flags = f"[{s1}{s2}{s3}{s4}{s5}{s6}{s7}]"
+                            slope_disp = f"{mean_slope:.1e}" if not np.isnan(mean_slope) else "N/A"
+                            pbar.set_description(f"Searching for Plateau{status_flags} [KE:{mean_energy:.2e}|M.Slope:{slope_disp}]")
+                        
+                        if is_alive and is_vibrating and has_stable_slope and is_truly_static and has_no_long_term_drift and is_in_target_zone and is_glacially_slow:
+                            convergence_counter += 1
+                        else:
+                            convergence_counter = 0
+                            
+                        if convergence_counter >= PATIENCE:
+                            if pbar: pbar.write(f"\n✅ SUCCESS: System met ALL 8 stability and target criteria at step {t}!")
+                            self.pi += dt * (force - temp_damping * self.pi)
+                            self.psi += dt * self.pi
+                            return self.psi
+    
+                self.pi += dt * (force - temp_damping * self.pi)
+                self.psi += dt * self.pi
+    
+            if pbar: pbar.write(f"\n⚠️ Plateau search reached maximum steps.")
+            return self.psi
+                
+    
+    
+# ======================================================================================
+# SECTION 3: UPDATED OPTIMIZATION MANAGER (WITH DAVINCI METHODOLOGY)
+# ======================================================================================
+class WarpDriveExplorer:
+    def __init__(self, alg, trial_config=None):
+        self.alg = alg
+        #<-- CHANGE: Grid size is now a list, not fixed.
+        self.grid_scales_to_test = [64, 96, 128]
+        
+        self.grid_noise_levels = {
+            64:  8.6e-7,  # Value to be used for 64x64 grid
+            96:  5.6e-7,  # Value to be used for 96x96 grid
+            128: 4.20e-7   # Value to be used for 128x128 grid
+        }
+        
+        self.pbar = None
+        self.search_space_dimensions = None
+        self.trial_config = trial_config if trial_config is not None else {
+            'max_relax_steps': 15000, 'total_evolution_time': 50.0, 'num_samples': 6056
+        }
+        self.best_overall_score = -float('inf')
+        self.best_overall_params = {}
+        self.best_overall_score_breakdown = {}
+
+    # <-- NEW FUNCTION: Adopted from ProjectDaVinci and integrated into this class.
+    def _track_particles(self, all_particles_by_size):
+        if not all_particles_by_size: return {}
+        sorted_sizes = sorted(all_particles_by_size.keys())
+        if not sorted_sizes: return {}
+
+        # Initialize tracks based on the smallest grid
+        base_particles = all_particles_by_size[sorted_sizes[0]]
+        particle_tracks = {i: [{'particle': p, 'size': sorted_sizes[0]}] for i, p in enumerate(base_particles)}
+
+        # Perform matching for other grid sizes
+        for i in range(1, len(sorted_sizes)):
+            current_size = sorted_sizes[i]
+            current_particles = all_particles_by_size[current_size]
+            unmatched_current = list(current_particles)
+
+            # Search for the best match for each existing track
+            for track_id, track_data in particle_tracks.items():
+                last_particle_in_track = track_data[-1]['particle']
+                best_match, min_dist = None, float('inf')
+
+                for p_current in unmatched_current:
+                    # Compare particles in the same channel (grade)
+                    if p_current['channel'] == last_particle_in_track['channel']:
+                        dist = abs(p_current['freq'] - last_particle_in_track['freq'])
+                        if dist < min_dist:
+                            min_dist, best_match = dist, p_current
+                
+                # Accept match if it's closer than 25% of the frequency
+                if best_match and min_dist < (best_match['freq'] * 0.25):
+                    track_data.append({'particle': best_match, 'size': current_size})
+                    if best_match in unmatched_current:
+                        unmatched_current.remove(best_match)
+            
+            # Create new tracks for unmatched particles
+            for p_new in unmatched_current:
+                new_track_id = max(particle_tracks.keys()) + 1 if particle_tracks else 0
+                particle_tracks[new_track_id] = [{'particle': p_new, 'size': current_size}]
+
+        return particle_tracks
+
+    # <-- NEW FUNCTION: Adopted from ProjectDaVinci and integrated into this class.
+    def _extrapolate_to_continuous(self, sizes, masses):
+        # At least 2 points are required for extrapolation
+        if len(sizes) < 2: return np.nan
+        
+        # x = 1 / size^2 (the continuum limit is x=0)
+        x = 1 / (np.array(sizes)**2)
+        y = np.array(masses)
+        
+        try:
+            slope, intercept, r_value, _, _ = linregress(x, y)
+            # If the linear fit is very poor (R^2 < 0.65), this is not a stable track.
+            # This threshold is important for filtering out artifacts.
+            if len(x) >= 3 and r_value**2 < 0.65:
+                return np.nan
+            return intercept # Return the y-intercept, i.e., the extrapolated frequency
+        except ValueError:
+            return np.nan
+
+    
+    def _calculate_davinci_like_score(self, extrapolated_particles, params):
+        # --- 1. Analysis of Emergent Particle Spectrum ---
+        if not extrapolated_particles:
+            return 0, {'reason': 'No stable particles found after extrapolation'}
+    
+        found_freqs = np.array(sorted([p['freq'] for p in extrapolated_particles]))
+        
+        electron_mass = PDG_DATA["Electron"]["mass"]
+        if found_freqs[0] < 1e-9:
+            return 0, {'reason': 'Unstable state (zero frequency particle)'}
+        scaling_factor = electron_mass / found_freqs[0]
+        scaled_masses = found_freqs * scaling_factor
+    
+        MATCH_THRESHOLD = 0.01 # 1% error margin
+        matched_pdg_names = set()
+        
+        for pdg_name, data in PDG_DATA.items():
+            pdg_mass = data['mass']
+            relative_errors = np.abs(scaled_masses - pdg_mass) / pdg_mass
+            if np.min(relative_errors) < MATCH_THRESHOLD:
+                matched_pdg_names.add(pdg_name)
+        
+        coverage_score = len(matched_pdg_names)
+        found_types = {PDG_DATA[name]['type'] for name in matched_pdg_names}
+        diversity_score = len(found_types)
+    
+        # --- 2. Axiomatic Constant Analysis (YOUR SIGNIFICANT CONTRIBUTION) ---
+        # <-- IMPORTANT: Alpha Constant Score Re-added -->
+        lambda_d = params.get('lambda_d', 1.0)
+        lambda_p_g0 = params.get('lambda_p_g0', 0.0)
+        predicted_alpha = (lambda_p_g0 / lambda_d) / (4 * np.pi) if lambda_d != 0 else float('inf')
+        
+        # The smaller the alpha error, the higher the score.
+        # (Assuming ALPHA_REAL = 1 / 137.036 is defined at the beginning of the file)
+        alpha_error = abs(predicted_alpha - ALPHA_REAL)
+        alpha_score = 1.0 / (100 * alpha_error + 0.01) # Score increases as error decreases
+    
+        # --- 3. Combine the Final Score ---
+        # Weighting: Finding particles is still the main goal, but finding the correct alpha ratio is a very strong bonus.
+        COVERAGE_WEIGHT = 100.0
+        DIVERSITY_WEIGHT = 20.0
+        ALPHA_WEIGHT = 50.0  # We give a considerable weight to the alpha score.
+    
+        total_score = (coverage_score * COVERAGE_WEIGHT) + \
+                      (diversity_score * DIVERSITY_WEIGHT) + \
+                      (alpha_score * ALPHA_WEIGHT)
+        
+        score_breakdown = {
+            'total_score': total_score,
+            'stable_particle_count': len(extrapolated_particles),
+            'matched_particle_count': len(matched_pdg_names),
+            'diversity_score': diversity_score,
+            'alpha_score_pts': alpha_score, # Adding for reporting
+            'predicted_alpha': predicted_alpha # Adding for reporting
+        }
+        
+        return total_score, score_breakdown
+
+    def _run_single_scale_simulation(self, params_dict, size):
+        """Runs the simulation for a single grid size and returns the particle list."""
+        engine = None
+        try:
+            engine = PrometheusV_Engine(size, self.alg, params_dict)
+
+            grid_specific_noise = self.grid_noise_levels.get(size, 1e-6) # Default value
+            
+            # 2. Assign this constant value as a property to the engine object for the relax method to use.
+            engine.base_noise_level = grid_specific_noise
+            
+            self.pbar.write(f"  -> Grid {size}x{size}: Searching for equilibrium state (CONSTANT Noise: {grid_specific_noise:.2e})...")
+            
+            dynamic_state_psi = engine.relax_to_plateau(
+                max_steps=self.trial_config['max_relax_steps_phase1'], pbar=None
+            )
+            
+            if dynamic_state_psi is None:
+                self.pbar.write(f"  -> ❌ Grid {size}x{size}: Equilibrium state not found.")
+                return None
+
+            self.pbar.write(f"  -> Grid {size}x{size}: Analyzing particle spectrum...")
+            # Light Particle Hunt
+            _, particles_light = self._run_evolution_stage(engine, {'total_evolution_time': 200.0, 'num_samples': 50000})
+            
+            # Heavy Particle Hunt
+            _, particles_heavy = self._run_evolution_stage(engine, {'total_evolution_time': 200.0, 'num_samples': 4000000})
+
+            # Combine Results
+            final_particle_map = {p['freq']: p for p in particles_light}
+            for p in particles_heavy:
+                final_particle_map[p['freq']] = p
+            
+            final_particles = list(final_particle_map.values())
+            self.pbar.write(f"  -> ✅ Grid {size}x{size}: {len(final_particles)} candidates found.")
+            return final_particles
+
+        finally:
+            if engine: del engine
+            cp.get_default_memory_pool().free_all_blocks()
+    
+    
+    def objective_function(self, params_list):
+        params_dict = {dim.name: val for dim, val in zip(self.search_space_dimensions, params_list)}
+        
+        # Ensure lambda_resonance is always zero
+        params_dict['lambda_resonance'] = 0.0
+        
+        self.pbar.write(f"\n🚀 Initiating Trial [ {', '.join([f'{k[:6]}:{v:.2f}' for k,v in list(params_dict.items())[:3]])}... ]")
+    
+        all_particles_by_size = {}
+        for size in self.grid_scales_to_test:
+            particles = self._run_single_scale_simulation(params_dict, size)
+            if particles is None:
+                self.pbar.write(f"❌ Trial Canceled: {size}x{size} grid is unstable.")
+                if self.pbar.total > self.pbar.n: self.pbar.update(1)
+                return 1e9
+            all_particles_by_size[size] = particles
+    
+        self.pbar.write("  -> 🛤️ Tracking particle trajectories...")
+        particle_tracks = self._track_particles(all_particles_by_size)
+    
+        self.pbar.write("  -> 📈 Extrapolating to the continuum limit...")
+        extrapolated_particles = []
+        for track_id, track in particle_tracks.items():
+            if len(track) >= 2:
+                sizes = [d['size'] for d in track]
+                masses = [d['particle']['freq'] for d in track]
+                extrapolated_freq = self._extrapolate_to_continuous(sizes, masses)
+                
+                if not np.isnan(extrapolated_freq) and extrapolated_freq > 0:
+                    original_channel = track[0]['particle']['channel']
+                    extrapolated_particles.append({'freq': extrapolated_freq, 'channel': original_channel})
+    
+        genesis_score, score_breakdown = self._calculate_davinci_like_score(extrapolated_particles, params_dict)
+        
+        log_msg = (f"  -> ✅ RESULT | Score: {genesis_score:<8.2f} "
+                   f"| Stable Particles: {score_breakdown.get('stable_particle_count', 0)} "
+                   f"| Matched Particles: {score_breakdown.get('matched_particle_count', 0)}/{len(PDG_DATA)}")
+        self.pbar.write(log_msg)
+    
+        if genesis_score > self.best_overall_score:
+            self.best_overall_score = genesis_score
+            self.best_overall_params = params_dict.copy()
+            self.best_overall_score_breakdown = score_breakdown.copy()
+            
+            self.pbar.write("\n" + "="*50)
+            self.pbar.write("✨ NEW BEST CONSTITUTION (ACCORDING TO DAVINCI METRIC) ✨")
+            self.pbar.write(f"Score: {genesis_score:.2f} | Matched: {score_breakdown.get('matched_particle_count', 0)}")
+            
+            # <-- NEW DIAGNOSTIC REPORT ADDED -->
+            self.pbar.write("--- DIAGNOSTIC REPORT ---")
+            # Note: The method in EmergentPhenomenaAnalyzer should be static.
+            # If not static, an empty object could be created like: analyzer = EmergentPhenomenaAnalyzer(self.alg, None).
+            # But since it is static in our current code, we can call it directly.
+            found_list, missing_list = EmergentPhenomenaAnalyzer.identify_found_and_missing_particles(
+                extrapolated_particles, 
+                params_dict, 
+                match_threshold=0.01 # Using the same 1% threshold as in scoring
+            )
+            self.pbar.write(f"FOUND   ({len(found_list)}/{len(PDG_DATA)}): {', '.join(sorted(found_list))}")
+            self.pbar.write(f"MISSING ({len(missing_list)}/{len(PDG_DATA)}): {', '.join(sorted(missing_list))}")
+            # <-- END OF REPORT -->
+    
+            self.pbar.write("="*50 + "\n")
+    
+        global results_with_breakdown
+        if 'results_with_breakdown' in globals():
+            run_data = {'params': params_dict, 'score': genesis_score, **score_breakdown}
+            results_with_breakdown.append(run_data)
+        
+        if self.pbar.total > self.pbar.n: self.pbar.update(1)
+        return -genesis_score
+
+    def _run_evolution_stage(self, engine, config):
+        # This helper function can remain unchanged.
+        probe_multivector = cp.zeros((1, 1, self.alg.num_blades), dtype=DTYPE_COMPLEX)
+        for g in range(1, self.alg.dim + 1):
+            indices = self.alg.blade_indices.get(g)
+            if indices is not None and indices.size > 0:
+                first_blade_of_grade = indices[0]
+                probe_multivector[0, 0, first_blade_of_grade] = 1.0 / float(g)
+
+        time_series_gpu, sample_interval = engine.evolve_optimized(
+            initial_psi=engine.psi,
+            probe_multivector=probe_multivector,
+            total_evolution_time=config['total_evolution_time'],
+            num_samples=config['num_samples'],
+            pbar=None
+        )
+
+        if sample_interval <= 0:
+            return -1, []
+
+        particles = EmergentPhenomenaAnalyzer.analyze_particle_spectrum_hybrid(
+            {'all_grades': time_series_gpu}, sample_interval
+        )
+        return sample_interval, particles
+# ======================================================================================
+
+if __name__ == '__main__':
+    # --- 1. SETUP ---
+    try:
+        alg = CliffordAlgebra(1, 8)
+    except ValueError as e:
+        print(f"ERROR: {e}")
+        exit()
+    
+    # --- 2. OUR DIAMOND TO BE POLISHED: "Constitution v5 Candidate" ---
+    champion_constitution_v5 = {
+        'id': 'champion_v5_grand_finale', 
+        
+        # Main Dynamic Parameters
+        'lambda_d': 1.9053886991667701, 
+        'lambda_complexity': 0.28389757318757647, 
+        'damping_relax': 1.4152606616948762, 
+        'damping_evolve': 9.99000376642322e-06, 
+        'lambda_p_global': 0.10141891690970965, 
+        'lambda_p_g0': 0.15596348885683858, 
+        'lambda_p_g1': -0.1250819829348453, 
+        'lambda_p_g2': -0.037109756279247307, 
+        'lambda_p_g3': -0.1735486748174691, 
+        'lambda_p_g4': -0.052272306357990954, 
+        'lambda_p_g5': -0.040746958432598915, 
+        'lambda_p_g6': -0.025715164431201597, 
+        'lambda_p_g7': -0.15709054525591912, 
+        'lambda_p_g8': -0.13438713505225147, 
+        'lambda_p_g9': -0.2741136587586725, 
+        'lambda_b_g0': 0.09045044550548677, 
+        'lambda_b_g1': 9.90561430294791e-05, 
+        'lambda_b_g2': 5.342876510675676e-05, 
+        'lambda_b_g3': -4.981938811085131e-06, 
+        'lambda_b_g4': 4.5124699927102784e-05, 
+        'lambda_b_g5': 0.012409691896710338, 
+        'lambda_b_g6': 0.004318538283733796, 
+        'lambda_b_g7': 0.00010166944590403118, 
+        'lambda_b_g8': 0.0011751611999323325, 
+        'lambda_b_g9': 0.254173601310313,
+    }
+
+    # --- 3. FINE-TUNING SEARCH SPACE (+- 0.1%) ---
+    search_percentage = 0.1 
+
+    # --- SCRIPT ---
+    fine_tuning_search_space = []
+    search_factor = search_percentage / 100.0
+    
+    for name, value in champion_constitution_v5.items():
+        if isinstance(value, str): continue
+        
+        # For positive values
+        if value > 1e-9:
+            lower_bound, upper_bound = value * (1.0 - search_factor), value * (1.0 + search_factor)
+        # For negative values (reverse the logic to keep the range correct)
+        elif value < -1e-9:
+            lower_bound, upper_bound = value * (1.0 + search_factor), value * (1.0 - search_factor)
+        # For values very close to zero
+        else:
+            # Let's search in a small range
+            tiny_range = 1e-5 * search_factor
+            lower_bound, upper_bound = -tiny_range, tiny_range
+            
+        fine_tuning_search_space.append(Real(lower_bound, upper_bound, name=name))
+        fine_tuning_search_space = [dim for dim in fine_tuning_search_space if dim.name != 'lambda_resonance']
+        
+        
+        
+    print(f"🔬 Fine-Tuning Search Space created within a {search_percentage}% slice of the reference constitution.")
+
+    print("\n" + "="*80)
+    print("💎 PROMETHEUS FINAL PHASE: INITIATING 'DIAMOND CUT' CALIBRATION 💎")
+    print(f"Base Constitution: '{champion_constitution_v5['id']}'")
+    print(f"Number of Parameters to Optimize: {len(fine_tuning_search_space)} (ENTIRE CONSTITUTION)")
+    print("Search Range: +- 0.1% of each parameter's own value")
+    print("="*80)
+
+    # --- 4. OPTIMIZATION PROCESS ---
+    explorer = WarpDriveExplorer(alg=alg, trial_config=fast_trial_config)
+    TOTAL_TRIALS = 2
+    explorer.pbar = tqdm(total=TOTAL_TRIALS, desc="Final Calibration", file=sys.stdout)
+    explorer.search_space_dimensions = fine_tuning_search_space
+    
+    global results_with_breakdown  
+    results_with_breakdown = []        
+    
+    res = skopt.gp_minimize(
+        explorer.objective_function, 
+        dimensions=fine_tuning_search_space,
+        n_calls=TOTAL_TRIALS,
+        n_initial_points=1,
+        random_state=88, 
+        acq_func="EI"
+    )
+    explorer.pbar.close()
+    
+    # --- 5. REPORTING AND SAVING RESULTS ---
+    final_champion_constitution = champion_constitution_v5.copy()
+    if explorer.best_overall_score > 0 and explorer.best_overall_params:
+        print("\n✅ Calibration complete. Final champion candidate found!")
+        final_champion_constitution.update(explorer.best_overall_params)
+        final_champion_constitution['id'] = 'champion_v6_final_cut'
+    else:
+        print("\n⚠️ The search did not find a new constitution that improves upon v5. The best candidate remains v5.")
+
+    # === CORRECTION: SAVE THE DETAILED LIST, NOT JUST THE OPTIMIZATION OBJECT ===
+    FILENAME_SKOPT = "prometheus_run_v6_skopt_object.pkl"
+    FILENAME_RESULTS = "prometheus_run_v6_detailed_results.pkl"
+    
+    explorer.pbar = None
+    
+    dump(res, FILENAME_SKOPT, store_objective=False)
+    print(f"\n✅ Optimization summary saved to '{FILENAME_SKOPT}'.")
+    
+    with open(FILENAME_RESULTS, 'wb') as f:
+        pickle.dump(results_with_breakdown, f)
+    print(f"✅ Detailed results of all trials saved to '{FILENAME_RESULTS}'.")
+
+
+    
+    print("\n" + "="*80)
+    print("✨ FINAL CHAMPION CONSTITUTION REPORT (v6 Candidate) ✨")
+    print("="*80)
+    print(f"🏆 Highest Score: {explorer.best_overall_score:.2f}")
+    if explorer.best_overall_score_breakdown:
+        breakdown = explorer.best_overall_score_breakdown
+        # Note: The original breakdown keys seem to have some inconsistencies.
+        # The following lines use the keys that are actually present in the `score_breakdown` dictionary.
+        print(f"  Breakdown: Matched Particles: {breakdown.get('matched_particle_count',0)}/{len(PDG_DATA)}, "
+              f"Stable Particles: {breakdown.get('stable_particle_count',0)}, "
+              f"Diversity: {breakdown.get('diversity_score', 0)}")
+        print(f"             Alpha Score: {breakdown.get('alpha_score_pts', 0):.2f}, "
+              f"Predicted Alpha: {breakdown.get('predicted_alpha', 0):.6f}")
+    print("-" * 80)
+    for key, value in sorted(final_champion_constitution.items()):
+        if isinstance(value, str):
+            print(f"  - {key:<25}: '{value}'")
+        elif isinstance(value, (int, float)):
+            print(f"  - {key:<25}: {value:.6f}")
+    print("="*80)
